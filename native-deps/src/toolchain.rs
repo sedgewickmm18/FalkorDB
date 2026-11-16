@@ -123,14 +123,29 @@ impl Toolchain {
         let cc_probe = cc.clone().unwrap_or_else(|| "cc".to_owned());
         let cxx_probe = cxx.clone().unwrap_or_else(|| "c++".to_owned());
 
+        let cc_version = version_line(&cc_probe).unwrap_or_else(|| format!("unknown ({cc_probe})"));
+        let openmp = detect_openmp();
+        // Fail fast on the gcc + static-libomp combination rather than deep in
+        // the GraphBLAS build: the forced `-fopenmp=libomp` is a clang-only
+        // spelling, and GCC rejects it on the very first PreJIT kernel
+        // ("unrecognized command-line option '-fopenmp=libomp'"). This bites
+        // when $CC is not exported to cargo and cmake falls back to `cc`.
+        if matches!(openmp, OpenMp::Static { .. }) && cc_version.contains("GCC") {
+            return Err(crate::err!(
+                "static libomp detected but the C compiler is GCC ({cc_version}); \
+                 `-fopenmp=libomp` is clang-only. Export CC=clang (and CXX=clang++) \
+                 before running cargo/build-native.sh."
+            ));
+        }
+
         Ok(Self {
-            cc_version: version_line(&cc_probe).unwrap_or_else(|| format!("unknown ({cc_probe})")),
             cxx_version: version_line(&cxx_probe)
                 .unwrap_or_else(|| format!("unknown ({cxx_probe})")),
+            cc_version,
             cc,
             cxx,
             target: host_triple(),
-            openmp: detect_openmp(),
+            openmp,
         })
     }
 

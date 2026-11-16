@@ -145,6 +145,10 @@ pub fn build(
     let flags = ctx.toolchain.common_c_flags();
     CMake::new(&source, &build_dir)
         .arg(format!("-DCMAKE_INSTALL_PREFIX={}", entry.display()))
+        // Fedora's GNUInstallDirs defaults to lib64/, but this recipe (and the
+        // LAGraph one, which hardcodes {prefix}/lib/libgraphblas.a) expect a
+        // flat lib/ layout inside the cache entry.
+        .arg("-DCMAKE_INSTALL_LIBDIR=lib")
         .arg("-DSUITESPARSE_USE_FORTRAN=OFF")
         .arg("-DBUILD_STATIC_LIBS=ON")
         .arg("-DBUILD_SHARED_LIBS=OFF")

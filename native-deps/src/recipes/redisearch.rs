@@ -22,11 +22,12 @@ use std::path::{Path, PathBuf};
 use crate::err;
 use crate::error::Result;
 use crate::recipes::{Ctx, SourceGuard, cleanup_build_dir, prepare_entry};
-use crate::util::{capture_opt, copy_file, find_archives, log, run_isolated};
+use crate::util::{capture_opt, copy_file, env_flag, find_archives, log, run_isolated};
 
 const MAIN_ARCHIVE_NAMES: [&str; 2] = ["redisearch.a", "redisearch.so"];
 const VECSIM_CMAKELISTS: &str = "deps/VectorSimilarity/src/VecSim/CMakeLists.txt";
 const VECSIM_VEC_UTILS: &str = "deps/VectorSimilarity/src/VecSim/utils/vec_utils.cpp";
+const TIERED_FACTORY_H: &str = "deps/VectorSimilarity/src/VecSim/index_factories/tiered_factory.h";
 
 pub fn build(
     ctx: &Ctx<'_>,
@@ -45,6 +46,7 @@ pub fn build(
     super::ensure_git_root(&source, &mut guard)?;
     relax_vecsim_warnings(&source, &mut guard)?;
     include_string_in_vec_utils(&source, &mut guard)?;
+    guard_tiered_factory_include(&source, &mut guard)?;
 
     // Build RediSearch 8.6 as an embeddable STATIC library:
     //   REDISEARCH_BUILD_AS_LIBRARY=ON  omit src/module_main.c and its
@@ -61,6 +63,16 @@ pub fn build(
         "-DREDISEARCH_BUILD_AS_LIBRARY=ON -DREDISEARCH_BUILD_SHARED=OFF \
          -DCMAKE_POSITION_INDEPENDENT_CODE=ON",
     );
+    // USE_SVS=OFF: with USE_SVS on, cmake fetches Intel's SVS (shared-lib
+    // tarball or a full source build via FetchContent), which fails offline
+    // and on compilers the SVS binaries don't cover — the configure then
+    // leaves VecSim compiling against SVS headers that were never fetched
+    // ('svs/index/vamana/dynamic_index.h' file not found). SVS is an optional
+    // vector-index optimization; FalkorDB's vector search works without it.
+    // Opt back in by setting BUILD_INTEL_SVS_OPT=1 in the environment.
+    if !env_flag("BUILD_INTEL_SVS_OPT") {
+        cmake_args.push_str(" -DUSE_SVS=OFF");
+    }
     if let Some(cc) = &ctx.toolchain.cc {
         cmake_args.push_str(&format!(" -DCMAKE_C_COMPILER={cc}"));
     }
@@ -83,6 +95,28 @@ pub fn build(
     collect(&source, entry, ctx.san.is_some(), &ctx.toolchain.target)?;
     cleanup_build_dir(&scratch);
     Ok(())
+}
+
+/// `tiered_factory.h` includes `svs_tiered.h` (which includes `svs.h`)
+/// unconditionally, but the SVS headers are only present when USE_SVS=ON.
+/// Guard the include so non-SVS builds compile cleanly — the same edit
+/// `redisearch.sh` used to make via sed.
+fn guard_tiered_factory_include(
+    source: &Path,
+    guard: &mut SourceGuard,
+) -> Result<()> {
+    const UNGUARDED: &str = "#include \"VecSim/algorithms/svs/svs_tiered.h\"\n";
+    const GUARDED: &str = "#if HAVE_SVS\n#include \"VecSim/algorithms/svs/svs_tiered.h\"\n#endif\n";
+    let path = source.join(TIERED_FACTORY_H);
+    let text =
+        fs::read_to_string(&path).map_err(|e| err!("cannot read {}: {e}", path.display()))?;
+    if !text.contains(UNGUARDED) {
+        // Already guarded (or the include moved upstream) — nothing to do.
+        return Ok(());
+    }
+    guard.snapshot(&path)?;
+    fs::write(&path, text.replacen(UNGUARDED, GUARDED, 1))
+        .map_err(|e| err!("cannot write {}: {e}", path.display()))
 }
 
 /// VecSim promotes some warnings to errors; our toolchain is newer than the one

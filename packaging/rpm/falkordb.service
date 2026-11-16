@@ -1,0 +1,30 @@
+[Unit]
+Description=FalkorDB graph database (Redis module)
+Documentation=https://docs.falkordb.com/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=falkordb
+Group=falkordb
+ExecStart=/usr/libexec/falkordb/redis-server /etc/falkordb/falkordb.conf --supervised systemd --daemonize no
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=90s
+LimitNOFILE=65535
+UMask=0077
+WorkingDirectory=/var/lib/falkordb
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ReadWritePaths=/var/lib/falkordb
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target
