@@ -2,7 +2,7 @@ import os
 from common import *
 
 GRAPH_ID = "config"
-NUMBER_OF_CONFIGURATIONS = 24 # number of configurations available
+NUMBER_OF_CONFIGURATIONS = 25 # number of configurations available
 
 class testConfig(FlowTestsBase):
     def __init__(self):
@@ -52,7 +52,8 @@ class testConfig(FlowTestsBase):
                 ("IMPORT_FOLDER", "/var/lib/FalkorDB/import/"),
                 ("TEMP_FOLDER", "/tmp"),
                 ("JS_HEAP_SIZE", 256 * 1024 * 1024),
-                ("JS_STACK_SIZE", 1024 * 1024)
+                ("JS_STACK_SIZE", 1024 * 1024),
+                ("WRITE_LOCK_POLL_INTERVAL", 5)
         ]
 
         for i, config in enumerate(response):
@@ -325,6 +326,26 @@ class testConfig(FlowTestsBase):
         expected_response = config_value
         self.env.assertEqual(response, expected_response)
 
+        # #3413: any non-negative i64 is accepted, as in C. FalkorDB Cloud loads
+        # the module with VKEY_MAX_ENTITY_COUNT 4611686000000000000, and
+        # CONFIG REWRITE saves it as a native `graph.` line; on restart Redis
+        # applies that line through the same range check `CONFIG SET` uses, so
+        # a narrower range aborted the server.
+        # 0 means no limit (one key); GRAPH.CONFIG SET already accepted it,
+        # so the native config must too, or CONFIG REWRITE saves a line the
+        # restart rejects.
+        for value in [0, 4611686000000000000, 9223372036854775807]:
+            self.env.assertEqual(self.redis_con.execute_command(
+                "CONFIG", "SET", "graph.VKEY_MAX_ENTITY_COUNT", str(value)), "OK")
+            # config_get returns a dict under both RESP2 and RESP3
+            self.env.assertEqual(
+                self.redis_con.config_get("graph.VKEY_MAX_ENTITY_COUNT"),
+                {"graph.VKEY_MAX_ENTITY_COUNT": str(value)})
+            self.env.assertEqual(self.db.config_set(config_name, value), "OK")
+            self.env.assertEqual(self.db.config_get(config_name), value)
+
+        self.env.assertEqual(self.db.config_set(config_name, 100000), "OK")
+
     def test11_set_get_node_creation_buffer(self):
         # flush and stop is needed for memcheck for clean shutdown
         self.graph.delete()
@@ -421,6 +442,37 @@ class testConfig(FlowTestsBase):
 
         # nothing changed
         self.env.assertEqual(self.redis_con.execute_command("GRAPH.CONFIG GET *"), prev_conf)
+
+    def test15_set_get_write_lock_poll_interval(self):
+        config_name = "WRITE_LOCK_POLL_INTERVAL"
+
+        # default value
+        self.env.assertEqual(self.db.config_get(config_name), 5)
+
+        # update at run-time
+        self.env.assertEqual(self.db.config_set(config_name, 25), "OK")
+        self.env.assertEqual(self.db.config_get(config_name), 25)
+
+        # 0 is valid: a writer waits for the write lock in one go, holding the
+        # GIL until it is free
+        self.env.assertEqual(self.db.config_set(config_name, 0), "OK")
+        self.env.assertEqual(self.db.config_get(config_name), 0)
+
+        # negatives are rejected and the previous value is preserved
+        try:
+            self.db.config_set(config_name, -1)
+            assert(False)
+        except redis.exceptions.ResponseError as e:
+            assert(("Failed to set config value %s to -1" % config_name) in str(e))
+        self.env.assertEqual(self.db.config_get(config_name), 0)
+
+        # settable as a module load argument
+        # flush first for a clean shutdown under memcheck
+        self.redis_con.flushall()
+        self.env.stop()
+        self.env, self.db = Env(moduleArgs='WRITE_LOCK_POLL_INTERVAL 15')
+        self.redis_con = self.env.getConnection()
+        self.env.assertEqual(self.db.config_get(config_name), 15)
 
 import stat
 import shutil

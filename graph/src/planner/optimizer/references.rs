@@ -52,7 +52,9 @@ pub(super) fn ir_references_variable(
                     .iter()
                     .any(|(v, _)| v.id == var_id && v.scope_id == scope_id)
         }
-        IR::Filter(expr) => expr_references_variable(expr, var_id, scope_id),
+        IR::Filter(expr) | IR::Skip(expr) | IR::Limit(expr) => {
+            expr_references_variable(expr, var_id, scope_id)
+        }
         IR::Sort(exprs) => exprs
             .iter()
             .any(|(expr, _)| expr_references_variable(expr, var_id, scope_id)),
@@ -166,7 +168,6 @@ pub(super) fn ir_references_variable(
             expr_references_variable(file_path, var_id, scope_id)
                 || expr_references_variable(delimiter, var_id, scope_id)
         }
-        IR::Skip(expr) | IR::Limit(expr) => expr_references_variable(expr, var_id, scope_id),
         // Constructor patterns: `CREATE (n {p: x})` reads `x`.
         IR::Create(pattern) => query_graph_references_variable(pattern, var_id, scope_id),
         // Structural or variable-free: they bind and route rows, and hold no
@@ -187,13 +188,13 @@ pub(super) fn ir_references_variable(
         | IR::Union
         | IR::Commit
         | IR::CreateIndex { .. }
-        | IR::DropIndex { .. } => false,
+        | IR::DropIndex { .. }
+        | IR::NestedPlans => false,
         // Holds no expression: its children are the query's plan and the nested
         // plans, each visited as its own node. What a nested plan reads is not
         // lost either — the `ExprIR::NestedPlan` that calls it carries those
         // variables as children, so the expression holding the call reports
         // them. (`optimize` also strips this root before any pass runs.)
-        IR::NestedPlans => false,
     }
 }
 
@@ -230,57 +231,6 @@ pub(super) fn index_query_references_variable(
         }
     }
     false
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use orx_tree::DynTree;
-
-    use super::index_query_references_variable;
-    use crate::index::indexer::IndexQuery;
-    use crate::parser::ast::{ExprIR, QueryExpr, Variable};
-    use crate::runtime::functions::Type;
-
-    fn var(
-        id: u32,
-        scope_id: u32,
-    ) -> QueryExpr<Variable> {
-        Arc::new(DynTree::new(ExprIR::Variable(Variable {
-            name: None,
-            id,
-            scope_id,
-            ty: Type::Any,
-        })))
-    }
-
-    fn eq(value: QueryExpr<Variable>) -> IndexQuery<QueryExpr<Variable>> {
-        IndexQuery::Equal {
-            key: Arc::new("k".to_string()),
-            value,
-        }
-    }
-
-    /// A reference buried under nested `And`/`Or` is found, at any depth and in
-    /// any position among siblings, and only for the right `(id, scope)`.
-    #[test]
-    fn finds_a_reference_inside_nested_and_or() {
-        let deep = IndexQuery::And(vec![
-            eq(var(1, 0)),
-            IndexQuery::Or(vec![
-                eq(var(2, 0)),
-                IndexQuery::And(vec![eq(var(3, 0)), eq(var(7, 1))]),
-            ]),
-        ]);
-        assert!(index_query_references_variable(&deep, 7, 1));
-        assert!(index_query_references_variable(&deep, 1, 0));
-        assert!(
-            !index_query_references_variable(&deep, 7, 0),
-            "same id, other scope"
-        );
-        assert!(!index_query_references_variable(&deep, 9, 0));
-    }
 }
 
 /// Whether a CREATE/MERGE pattern's inline attributes reference the variable.
@@ -331,4 +281,55 @@ pub(super) fn subtree_references_variable(
 ) -> bool {
     node.walk::<Bfs>()
         .any(|e| matches!(e, ExprIR::Variable(v) if v.id == var_id && v.scope_id == scope_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use orx_tree::DynTree;
+
+    use super::index_query_references_variable;
+    use crate::index::indexer::IndexQuery;
+    use crate::parser::ast::{ExprIR, QueryExpr, Variable};
+    use crate::runtime::functions::Type;
+
+    fn var(
+        id: u32,
+        scope_id: u32,
+    ) -> QueryExpr<Variable> {
+        Arc::new(DynTree::new(ExprIR::Variable(Variable {
+            alias: None,
+            id,
+            scope_id,
+            ty: Type::Any,
+        })))
+    }
+
+    fn eq(value: QueryExpr<Variable>) -> IndexQuery<QueryExpr<Variable>> {
+        IndexQuery::Equal {
+            key: Arc::new("k".to_string()),
+            value,
+        }
+    }
+
+    /// A reference buried under nested `And`/`Or` is found, at any depth and in
+    /// any position among siblings, and only for the right `(id, scope)`.
+    #[test]
+    fn finds_a_reference_inside_nested_and_or() {
+        let deep = IndexQuery::And(vec![
+            eq(var(1, 0)),
+            IndexQuery::Or(vec![
+                eq(var(2, 0)),
+                IndexQuery::And(vec![eq(var(3, 0)), eq(var(7, 1))]),
+            ]),
+        ]);
+        assert!(index_query_references_variable(&deep, 7, 1));
+        assert!(index_query_references_variable(&deep, 1, 0));
+        assert!(
+            !index_query_references_variable(&deep, 7, 0),
+            "same id, other scope"
+        );
+        assert!(!index_query_references_variable(&deep, 9, 0));
+    }
 }

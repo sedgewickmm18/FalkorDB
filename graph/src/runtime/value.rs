@@ -42,7 +42,16 @@ use crate::{
         graph::{LabelId, NodeId, RelationshipId},
         graphblas::serialization::{Decode, Encode, Reader, Writer, si_type},
     },
-    runtime::{functions::Type, ordermap::OrderMap, runtime::Runtime},
+    runtime::{
+        functions::{
+            Type,
+            temporal::{
+                MAX_DATE_YEAR, check_date_range, construct_duration_secs, decompose_duration,
+            },
+        },
+        ordermap::OrderMap,
+        runtime::Runtime,
+    },
 };
 
 /// The deepest a value may nest: `[]` and `{}` are depth 1, `[[]]` is depth 2.
@@ -155,43 +164,15 @@ impl Point {
         let dlat = lat2 - lat1;
         let dlon = lon2 - lon1;
 
+        // `a` is sin²(c/2), mathematically in [0, 1]; for (near-)antipodal
+        // points it rounds just above 1 and `(1.0 - a).sqrt()` would be NaN.
         let a = (lat1.cos() * lat2.cos())
-            .mul_add((dlon / 2.0).sin().powi(2), (dlat / 2.0).sin().powi(2));
+            .mul_add((dlon / 2.0).sin().powi(2), (dlat / 2.0).sin().powi(2))
+            .clamp(0.0, 1.0);
         let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
 
         // Earth's radius in meters
         EARTH_RADIUS * c
-    }
-
-    /// Validates that the point coordinates are within valid ranges
-    pub fn validate(&self) -> Result<(), String> {
-        // Check for NaN or infinite values first
-        if !self.latitude.is_finite() {
-            return Err(format!(
-                "latitude must be a finite number, got {}",
-                self.latitude
-            ));
-        }
-        if !self.longitude.is_finite() {
-            return Err(format!(
-                "longitude must be a finite number, got {}",
-                self.longitude
-            ));
-        }
-        // Then check range bounds
-        if self.latitude < -90.0 || self.latitude > 90.0 {
-            return Err(format!(
-                "latitude should be within the range -90.0 to 90.0, got {}",
-                self.latitude
-            ));
-        }
-        if self.longitude < -180.0 || self.longitude > 180.0 {
-            return Err(format!(
-                "longitude should be within the range -180.0 to 180.0, got {}",
-                self.longitude
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -275,32 +256,34 @@ impl Value {
         }
     }
 
+    // Format datetime as ISO-8601: "2025-04-14T06:08:21"
     #[must_use]
     pub fn format_datetime(timestamp_secs: i64) -> String {
-        use chrono::{Datelike, TimeZone, Timelike, Utc};
-        match Utc.timestamp_opt(timestamp_secs, 0) {
-            chrono::LocalResult::Single(dt) => format!(
-                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
-                dt.year(),
-                dt.month(),
-                dt.day(),
-                dt.hour(),
-                dt.minute(),
-                dt.second()
-            ),
-            _ => format!("<invalid timestamp: {timestamp_secs}>"),
-        }
+        let days = timestamp_secs.div_euclid(86400);
+        let secs = timestamp_secs.rem_euclid(86400) as u32;
+        let (y, m, d) = civil_from_days_wide(days);
+        let mut s = String::with_capacity(19);
+        push_date(&mut s, y, m, d);
+        let mut buf = [0u8; 9];
+        buf[0] = b'T';
+        write_two_digits(&mut buf[1..3], secs / 3600);
+        buf[3] = b':';
+        write_two_digits(&mut buf[4..6], secs % 3600 / 60);
+        buf[6] = b':';
+        write_two_digits(&mut buf[7..9], secs % 60);
+        // Safe: ASCII digits, 'T' and ':'
+        s.push_str(unsafe { std::str::from_utf8_unchecked(&buf) });
+        s
     }
 
     // Format date as ISO-8601: "2025-04-14"
     #[must_use]
     pub fn format_date(timestamp_secs: i64) -> String {
         let days = timestamp_secs.div_euclid(86400);
-        let (y, m, d) = civil_from_days(days);
-        let mut buf = [0u8; 10];
-        write_date_into(&mut buf, y, m, d);
-        // Safe: ASCII digits and '-'
-        unsafe { String::from_utf8_unchecked(buf.to_vec()) }
+        let (y, m, d) = civil_from_days_wide(days);
+        let mut s = String::with_capacity(10);
+        push_date(&mut s, y, m, d);
+        s
     }
 
     // Format time as ISO-8601: "06:08:21"
@@ -317,7 +300,6 @@ impl Value {
 
     #[must_use]
     pub fn format_duration(duration_secs: i64) -> String {
-        use crate::runtime::functions::temporal::decompose_duration;
         use std::fmt::Write;
         let Ok((years, months, mut remaining)) = decompose_duration(duration_secs) else {
             return format!("PT{duration_secs}S");
@@ -720,17 +702,46 @@ fn add_duration_to_timestamp(
     ts: i64,
     dur_secs: i64,
 ) -> Result<i64, String> {
-    use crate::runtime::functions::temporal::decompose_duration;
-
     let (years, months, remaining_secs) = decompose_duration(dur_secs)?;
+    let (days, time_of_day) = shift_months(ts, years, months)?;
+    check_date_range(days * 86400 + time_of_day + remaining_secs)
+}
+
+/// Subtract a duration from a timestamp.
+fn sub_duration_from_timestamp(
+    ts: i64,
+    dur_secs: i64,
+) -> Result<i64, String> {
+    let (years, months, remaining_secs) = decompose_duration(dur_secs)?;
+    let (days, time_of_day) = shift_months(ts, -years, -months)?;
+    check_date_range(days * 86400 + time_of_day - remaining_secs)
+}
+
+/// Move `ts` by whole years and months, returning (days since epoch, time of
+/// day). A day past the end of the target month rolls over into the next
+/// month (2020-03-31 minus one month is 2020-03-02), as C's `timegm`
+/// normalisation does. Addition and subtraction share this so that
+/// `d - dur == d + (-dur)`.
+fn shift_months(
+    ts: i64,
+    years: i32,
+    months: i32,
+) -> Result<(i64, i64), String> {
     let days = ts.div_euclid(86400);
     let time_of_day = ts.rem_euclid(86400);
     let (y, m, d) = civil_from_days(days);
 
-    let new_year = y + years;
-    let new_month_raw = m as i32 + months;
-    let adj_year = new_year + (new_month_raw - 1).div_euclid(12);
+    // Widened, and range-checked before narrowing back to `i32`: a chain of
+    // additions near the limit must be an error, not a wrapped year.
+    let new_month_raw = i64::from(m) + i64::from(months);
+    let adj_year = i64::from(y) + i64::from(years) + (new_month_raw - 1).div_euclid(12);
     let adj_month = ((new_month_raw - 1).rem_euclid(12) + 1) as u32;
+    // One year of slack: the days applied afterwards can still bring the final
+    // date back inside the range; `check_date_range` has the last word.
+    if adj_year.abs() > i64::from(MAX_DATE_YEAR) + 1 {
+        return Err("Date out of range".to_string());
+    }
+    let adj_year = adj_year as i32;
     let max_day = days_in_month(adj_year, adj_month);
     let (final_year, final_month, final_day) = if d > max_day {
         let overflow = d - max_day;
@@ -745,31 +756,10 @@ fn add_duration_to_timestamp(
         (adj_year, adj_month, d)
     };
 
-    let new_days = days_from_civil(final_year, final_month, final_day);
-    Ok(new_days * 86400 + time_of_day + remaining_secs)
-}
-
-/// Subtract a duration from a timestamp.
-fn sub_duration_from_timestamp(
-    ts: i64,
-    dur_secs: i64,
-) -> Result<i64, String> {
-    use crate::runtime::functions::temporal::decompose_duration;
-
-    let (years, months, remaining_secs) = decompose_duration(dur_secs)?;
-    let days = ts.div_euclid(86400);
-    let time_of_day = ts.rem_euclid(86400);
-    let (y, m, d) = civil_from_days(days);
-
-    let new_year = y - years;
-    let new_month_raw = m as i32 - months;
-    let adj_year = new_year + (new_month_raw - 1).div_euclid(12);
-    let adj_month = ((new_month_raw - 1).rem_euclid(12) + 1) as u32;
-    let max_day = days_in_month(adj_year, adj_month);
-    let day = d.min(max_day);
-
-    let new_days = days_from_civil(adj_year, adj_month, day);
-    Ok(new_days * 86400 + time_of_day - remaining_secs)
+    Ok((
+        days_from_civil(final_year, final_month, final_day),
+        time_of_day,
+    ))
 }
 
 const fn days_in_month(
@@ -807,8 +797,19 @@ pub const fn days_from_civil(
 }
 
 /// Howard Hinnant's `civil_from_days`: days since 1970-01-01 -> (y, m, d).
+///
+/// The year is cut to `i32`; use [`civil_from_days_wide`] for an arbitrary
+/// persisted timestamp.
 #[must_use]
 pub const fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let (y, m, d) = civil_from_days_wide(z);
+    (y as i32, m, d)
+}
+
+/// [`civil_from_days`] with the year kept as `i64`, so every day number an
+/// `i64` of seconds can hold (year about +-2.9e11) keeps its real year.
+#[must_use]
+pub const fn civil_from_days_wide(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097); // [0, 146096]
@@ -819,27 +820,42 @@ pub const fn civil_from_days(z: i64) -> (i32, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
     let y = if m <= 2 { y + 1 } else { y };
-    (y as i32, m, d)
+    (y, m, d)
 }
 
-/// Write "YYYY-MM-DD" into buf[0..10]. buf must be at least 10 bytes.
-const fn write_date_into(
-    buf: &mut [u8],
-    y: i32,
+/// Append a date as "YYYY-MM-DD". Years outside 0..=9999 keep all their
+/// digits and a leading '-' when negative ("12345-01-01", "-0005-01-01").
+fn push_date(
+    s: &mut String,
+    y: i64,
     m: u32,
     d: u32,
 ) {
-    let yr = y.unsigned_abs();
-    buf[0] = b'0' + ((yr / 1000) % 10) as u8;
-    buf[1] = b'0' + ((yr / 100) % 10) as u8;
-    buf[2] = b'0' + ((yr / 10) % 10) as u8;
-    buf[3] = b'0' + (yr % 10) as u8;
-    buf[4] = b'-';
-    buf[5] = b'0' + ((m / 10) % 10) as u8;
-    buf[6] = b'0' + (m % 10) as u8;
-    buf[7] = b'-';
-    buf[8] = b'0' + ((d / 10) % 10) as u8;
-    buf[9] = b'0' + (d % 10) as u8;
+    if (0..=9999).contains(&y) {
+        let y = y as u32;
+        let mut buf = [0u8; 10];
+        write_two_digits(&mut buf[0..2], y / 100);
+        write_two_digits(&mut buf[2..4], y % 100);
+        buf[4] = b'-';
+        write_two_digits(&mut buf[5..7], m);
+        buf[7] = b'-';
+        write_two_digits(&mut buf[8..10], d);
+        // Safe: ASCII digits and '-'
+        s.push_str(unsafe { std::str::from_utf8_unchecked(&buf) });
+    } else {
+        use std::fmt::Write;
+        let sign = if y < 0 { "-" } else { "" };
+        let _ = write!(s, "{sign}{:04}-{m:02}-{d:02}", y.unsigned_abs());
+    }
+}
+
+/// Write `v` (0..=99) as two ASCII digits into buf[0..2].
+const fn write_two_digits(
+    buf: &mut [u8],
+    v: u32,
+) {
+    buf[0] = b'0' + (v / 10 % 10) as u8;
+    buf[1] = b'0' + (v % 10) as u8;
 }
 
 impl Hash for Value {
@@ -1032,9 +1048,6 @@ impl Value {
             }
             // Duration + Duration: decompose both, add components
             (Self::Duration(a), Self::Duration(b)) => {
-                use crate::runtime::functions::temporal::{
-                    construct_duration_secs, decompose_duration,
-                };
                 let (ya, ma, sa) = decompose_duration(a)?;
                 let (yb, mb, sb) = decompose_duration(b)?;
                 let total_months = i64::from(ya + yb) * 12 + i64::from(ma + mb);
@@ -1050,9 +1063,12 @@ impl Value {
             (Self::Datetime(d), Self::Duration(dur)) | (Self::Duration(dur), Self::Datetime(d)) => {
                 Ok(Self::Datetime(add_duration_to_timestamp(d, dur)?))
             }
-            (Self::Time(t), Self::Duration(dur)) | (Self::Duration(dur), Self::Time(t)) => {
-                Ok(Self::Time(add_duration_to_timestamp(t, dur)?))
-            }
+            // A time has no date: keep only the time of day. Every duration
+            // encoding is whole days (years/months/days) plus a clock offset,
+            // so the time of day of `t + dur` is the openCypher result.
+            (Self::Time(t), Self::Duration(dur)) | (Self::Duration(dur), Self::Time(t)) => Ok(
+                Self::Time((t.rem_euclid(86400) + dur.rem_euclid(86400)).rem_euclid(86400)),
+            ),
             (a, b) => Err(format!(
                 "Unexpected types for add operator ({}, {})",
                 a.name(),
@@ -1077,9 +1093,6 @@ impl Sub for Value {
             (Self::Int(a), Self::Float(b)) => Ok(Self::Float(a as f64 - b)),
             // Duration - Duration
             (Self::Duration(a), Self::Duration(b)) => {
-                use crate::runtime::functions::temporal::{
-                    construct_duration_secs, decompose_duration,
-                };
                 let (ya, ma, sa) = decompose_duration(a)?;
                 let (yb, mb, sb) = decompose_duration(b)?;
                 let total_months = i64::from(ya - yb) * 12 + i64::from(ma - mb);
@@ -1095,9 +1108,9 @@ impl Sub for Value {
             (Self::Datetime(d), Self::Duration(dur)) => {
                 Ok(Self::Datetime(sub_duration_from_timestamp(d, dur)?))
             }
-            (Self::Time(t), Self::Duration(dur)) => {
-                Ok(Self::Time(sub_duration_from_timestamp(t, dur)?))
-            }
+            (Self::Time(t), Self::Duration(dur)) => Ok(Self::Time(
+                (t.rem_euclid(86400) - dur.rem_euclid(86400)).rem_euclid(86400),
+            )),
             // Duration - Date/Datetime/Time is not allowed
             (Self::Duration(_), Self::Date(_) | Self::Datetime(_) | Self::Time(_)) => {
                 Err("Type mismatch: cannot subtract a temporal value from a duration".to_string())
@@ -1153,7 +1166,9 @@ impl Div for Value {
                 if b == 0 {
                     Err(String::from("Division by zero"))
                 } else {
-                    Ok(Self::Int(a.wrapping_div(b)))
+                    a.checked_div(b)
+                        .map(Self::Int)
+                        .ok_or_else(|| String::from("ArgumentError: integer overflow in division"))
                 }
             }
             (Self::Float(a), Self::Float(b)) => Ok(Self::Float(a / b)),
@@ -1374,6 +1389,8 @@ impl ValueGetType for Value {
 }
 
 impl Value {
+    /// The type's name as C spells it (`SIType_ToString`): what `typeOf()`
+    /// returns and what every "Type mismatch: … but was <name>" error prints.
     #[must_use]
     pub const fn name(&self) -> &'static str {
         match self {
@@ -1385,9 +1402,9 @@ impl Value {
             Self::List(_) => "List",
             Self::Map(_) => "Map",
             Self::Node(_) => "Node",
-            Self::Relationship(..) => "Relationship",
+            Self::Relationship(..) => "Edge",
             Self::Path(_) => "Path",
-            Self::VecF32(_) => "VecF32",
+            Self::VecF32(_) => "Vectorf32",
             Self::Point(_) => "Point",
             Self::Datetime(_) => "Datetime",
             Self::Date(_) => "Date",
@@ -1915,10 +1932,8 @@ pub fn sort_cmp_f64(
     a: f64,
     b: f64,
 ) -> Ordering {
-    match a.partial_cmp(&b) {
-        Some(ordering) => ordering,
-        None => a.is_nan().cmp(&b.is_nan()),
-    }
+    a.partial_cmp(&b)
+        .unwrap_or_else(|| a.is_nan().cmp(&b.is_nan()))
 }
 
 /// [`sort_cmp_f64`] for `f32` (points and vectors), except that `-0.0` sorts
@@ -1939,7 +1954,7 @@ fn sort_cmp_f32(
 /// The bits [`Value::hash`] uses for an `f32` component: one value for every
 /// NaN, as [`sort_cmp_f32`] treats them as equal.
 #[inline]
-fn f32_hash_bits(f: f32) -> u32 {
+const fn f32_hash_bits(f: f32) -> u32 {
     if f.is_nan() {
         f32::NAN.to_bits()
     } else {
@@ -1983,6 +1998,10 @@ fn sort_cmp_int_float(
 /// then the first element where `x != y` decides by `x > y`. So a NaN element
 /// never compares equal (not even to NaN) and orders `Less` in both
 /// directions.
+#[allow(
+    clippy::needless_bitwise_bool,
+    reason = "`|`, not `||`: the block compare must stay branch-free to vectorize"
+)]
 fn compare_vecf32(
     a: &[f32],
     b: &[f32],
@@ -2575,10 +2594,14 @@ mod sort_cmp_tests {
             Value::VecF32(Arc::new([1.0, f32::NAN].into_iter().collect())),
             Value::VecF32(Arc::new([1.0, -f32::NAN].into_iter().collect())),
             Value::VecF32(Arc::new([1.0, 2.0].into_iter().collect())),
-            Value::VecF32(Arc::new([-0.0].into_iter().collect())),
-            Value::VecF32(Arc::new([0.0].into_iter().collect())),
-            list(vec![Value::VecF32(Arc::new([-0.0].into_iter().collect()))]),
-            list(vec![Value::VecF32(Arc::new([0.0].into_iter().collect()))]),
+            Value::VecF32(Arc::new(std::iter::once(-0.0).collect())),
+            Value::VecF32(Arc::new(std::iter::once(0.0).collect())),
+            list(vec![Value::VecF32(Arc::new(
+                std::iter::once(-0.0).collect(),
+            ))]),
+            list(vec![Value::VecF32(Arc::new(
+                std::iter::once(0.0).collect(),
+            ))]),
             point(-0.0, 0.0),
             point(0.0, 0.0),
             point(f32::NAN, 1.0),
@@ -2616,7 +2639,7 @@ mod sort_cmp_tests {
                 }
             }
         }
-        let vec = |f: f32| Value::VecF32(Arc::new([f].into_iter().collect()));
+        let vec = |f: f32| Value::VecF32(Arc::new(std::iter::once(f).collect()));
         assert_eq!(vec(f32::NAN).sort_cmp(&vec(-f32::NAN)), Ordering::Equal);
         assert_ne!(vec(-0.0).sort_cmp(&vec(0.0)), Ordering::Equal);
         assert_ne!(point(-0.0, 0.0).sort_cmp(&point(0.0, 0.0)), Ordering::Equal);
@@ -2889,5 +2912,26 @@ mod nesting_tests {
             drop(back);
             drop(v);
         });
+    }
+}
+
+#[cfg(test)]
+mod date_format_tests {
+    use super::Value;
+
+    // A persisted timestamp is any i64 of seconds; its year (about 2.9e11 at
+    // the ends) must not be cut to an i32 on its way to the text.
+    #[test]
+    fn extreme_timestamps_keep_their_full_year() {
+        assert_eq!(Value::format_date(i64::MAX), "292277026596-12-04");
+        assert_eq!(
+            Value::format_datetime(i64::MAX),
+            "292277026596-12-04T15:30:07"
+        );
+        assert_eq!(Value::format_date(i64::MIN), "-292277022657-01-27");
+        assert_eq!(
+            Value::format_datetime(i64::MIN),
+            "-292277022657-01-27T08:29:52"
+        );
     }
 }
